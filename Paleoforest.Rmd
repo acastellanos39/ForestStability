@@ -1,0 +1,136 @@
+---
+title: "Paleoforest"
+author: "AAC"
+date: "2/25/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message = F, results = "hide", warning = F}
+packages <- c("foreach", "rgdal", "raster", "raster", "rgeos", "sf", "tidyverse", "magrittr", "dismo", "randomForest", "SDMTools", "cowplot")
+#lapply(packages, install.packages)
+lapply(packages, library, character.only = T)
+source("~/Desktop/Paleoforest/get.blocks.R")
+source("~/Desktop/Paleoforest/model.eval.R")
+```
+
+Start by grabbing the study extent and predictor variables.
+```{r}
+#grab spatial extent of Central America plus 2 degrees and read in the various variables
+CNTRY <- c("BLZ", "CRI", "GTM", "HND", "NIC", "PAN", "SLV")
+BORD <- lapply(CNTRY, function(x) raster::getData(country = x, level = 0))
+BORD <- do.call(bind, BORD)
+EXT <- extent(c(BORD@bbox[, 1] - 2, BORD@bbox[, 2] + 2)[c(1, 3, 2, 4)])
+PRED <- stack(list.files("~/Desktop/SDM/wc2.0_30s_bio", pattern = "tif", full.names = T)) #reads in bioclim
+names(PRED) <- unlist(purrr::map(strsplit(names(PRED), "_"), 4))
+PRED <- crop(PRED, EXT)
+```
+
+To generate presence points, grab the evergreen forest in the area and set a 95% threshold.
+```{r, eval = F}
+##generate presence points CAN SKIP if not running anything
+ENLF <- raster("~/Desktop/BIOD/consensus_full_class_1.tif") #Evergreen needleleaf proportional forest cover at 1km global scale
+EBLF <- raster("~/Desktop/BIOD/consensus_full_class_2.tif") #Evergreen broadleaf proportional forest cover at 1km global scale
+FRST <- crop(ENLF, EXT) + crop(EBLF, EXT) #crop them to the study extent and add them together to get evergreen forest proportion in Central America
+FRST[FRST < 95] <- NA #removes all areas with less than 95% evergreen forest cover
+```
+
+Check for correlation among the variables to determine which to use for modeling.
+```{r, eval = F}
+###CHECK FOR CORRELATION among the variables
+COR <- layerStats(PRED, "pearson", na.rm = T)
+symnum(COR[[1]])
+lapply(1:19, function(x) names(which(abs(COR[[1]][x, ]) > 0.8)))
+PCA <- prcomp(na.omit(getValues(PRED)), scale = T) #grabs the values, omits NA records, and runs a PCA on them
+abs(PCA$rotation[, 1:5])
+summary(PCA)$importance[2, 1:5]
+sort(apply(abs(PCA$rotation[, 1:3]), 1, sum), decreasing = T)
+apply(foreach(i = 1:3, .combine = cbind) %do% abs(PCA$rotation[, i]) * summary(PCA)$importance[2, i], 1, sum)
+```
+```{r}
+PREDI <- stack(PRED$X03, PRED$X05, PRED$X06, PRED$X07, PRED$X15, PRED$X16, PRED$X18, PRED$X19)#chosen uncorrelated variables
+names(PREDI) <- c("bio_3", "bio_5", "bio_6", "bio_7", "bio_15", "bio_16", "bio_18", "bio_19")
+```
+
+Generate absence points by using non-forest land cover and setting a 75% threshold (95% would give too few points)
+```{r, eval = F}
+##generate absence points
+NOTF <- lapply(list.files(path = "~/Desktop/BIOD", pattern = "consensus_full_class")[c(2:3, 5:8)], raster)
+NOTF <- stack(lapply(NOTF, crop, EXT))
+NOTF <- sum(NOTF)
+NOTF[NOTF < 75] <- NA
+NOTF <- raster::resample(NOTF, PRED[[1]], method = "bilinear") #resamples raster to be same resolution as bioclim variables
+ABS <- NOTF %>% rasterToPoints(spatial = T) %>% as("sf") %>% st_intersection(BUFF) %>% as("Spatial") %>% coordinates
+colnames(ABS) <- c("lon", "lat")
+write.csv(ABS, "absence_paleoforest75.csv", row.names = F)
+```
+
+Organize the presence and absence points by separate spatial blocks.
+```{r}
+PRES <- read.csv("~/Desktop/Paleoforest/caforest95.csv")
+ABSV <- read.csv("~/Desktop/Paleoforest/absence_paleoforest75.csv")
+BLOCK <- do.call(c, get.blocks(PRES[, 1:2], ABSV))
+DATA <- rbind(mutate(PRES[, 1:2], obs = 1), mutate(ABSV, obs = 0)) %>% mutate(block = BLOCK)
+DATA <- cbind(DATA, raster::extract(PREDI, DATA[, 1:2]))
+DATA <- na.omit(DATA)
+#TRAIN <- DATA %>% filter(block != 1)
+#TEST <- DATA %>% filter(block == 1)
+```
+
+```{r, eval = F}
+###Random forest parameterization
+NT <- c(500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000)
+MT <- c(1, 2, 3, 4, 6)
+
+cl <- makeCluster(10, "SOCK")
+registerDoSNOW(cl)
+RF <- foreach(k = 1:4, .packages = c("dismo", "randomForest", "foreach", "tidyverse"), .combine = "rbind") %dopar% {
+  TRAIN <- DATA %>% filter(block != k)
+  TEST <- DATA %>% filter(block == k)
+  foreach(i = 1:length(NT), .packages = c("dismo", "randomForest", "foreach"), .combine = "rbind.data.frame") %dopar% {
+  foreach(j = 1:length(MT), .packages = c("dismo", "randomForest"), .combine = "rbind") %dopar% {
+    m <- randomForest(x = TRAIN[, 5:12], y = TRAIN[, 3], ntree = i, mtry = j)
+    me <- evaluate(dplyr::filter(TEST, obs == 1)[, 1:2], dplyr::filter(TEST, obs == 0)[, 1:2], m, PREDI)
+    c(unlist(model.eval(me)), c(nt = as.character(NT[i]), mtry = as.character(MT[j]), block = k))
+  }
+}
+}
+```
+```{r, fig.width = 22, fig.height = 14}
+RF <- read.csv("~/Desktop/Paleoforest/randomforestparameterization.csv", header = T)
+RF$nt <- as.factor(RF$nt)
+RF$mtry <- as.factor(RF$mtry)
+PLT <- lapply(1:7, function(j) RF %>% ggplot(aes(x = nt, y = as.numeric(as.character(.[, j])), color = as.factor(mtry))) + geom_line(position = position_dodge(width = 1), size = 2) + geom_point(size = 2.5, position = position_dodge(width = 1)) + labs(x = "Number of trees", y = names(RF)[j]))
+plot_grid(plotlist = PLT)
+#ggsave("~/Desktop/forestparameters.pdf", width = 24, height = 12)
+```
+#I would go with either 3,000 and 4 or 4,000 and 6 (gonna go with 4,000 and 6)
+
+```{r}
+###Models
+M <- randomForest(x = DATA[, 5:12], y = DATA[, 3], ntree = 4000, mtry = 6)
+MP <- predict(PREDI, M, extent = EXT, progress = "")
+MP %>% rasterToPoints %>% data.frame %>% ggplot(aes(x = x, y = y, fill = layer)) + geom_tile() + scale_fill_viridis_c() + coord_fixed()
+LH <- stack(list.files(path = "~/Desktop/Paleoforest/LH_v1_2_5m", pattern = ".tif$", full.names = T))
+LHP <- predict(crop(LH[[names(PREDI)]], EXT), M, extent = EXT, progress = "")
+LHP %>% rasterToPoints %>% data.frame %>% ggplot(aes(x = x, y = y, fill = layer)) + geom_tile() + scale_fill_viridis_c() + coord_fixed()
+```
+
+```{r}
+MP <- resample(MP, LHP)
+STAB <- lapply(list(MP, LHP), log) %>% stack %>% calc(mean) %>% exp
+STAB %>% rasterToPoints %>% data.frame %>% ggplot(aes(x = x, y = y, fill = layer)) + geom_tile() + scale_fill_viridis_c() + coord_fixed()
+```
+
+`SDMTools::lcmw` is the best description I've seen for reproducing the dynamic model with an already produced function, but I don't think it is what we are looking for with the dynamic model
+
+```{r}
+tcost <- matrix(c(1, 0.5, 0, 0.5, 1, 0.5, 0, 0, 0, 0.5, 0, 0, 0, 0, 0, 0.5, 0, 0, 0, 0.5, 1, 0.5, 0, 0.5, 1), nrow = 5, ncol = 5) #cost window #~2 cells is 10 km, so a two cell distance is no cost, 3 cell is partial cost, and 4 cell is full cost
+MW <- lcmw(LHP, tcost, 2) 
+RAST <- LHP
+RAST[] <- t(MW)[408:1, ]
+RAST %>% rasterToPoints %>% data.frame %>% ggplot(aes(x = x, y = y, fill = layer)) + geom_tile() + scale_fill_viridis_c() + coord_fixed()
+```
